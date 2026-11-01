@@ -1,0 +1,14 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Runtime log written by the demo app
+logs/*.log
+
+# Stray tooling files
+node_modules/
+package-lock.json

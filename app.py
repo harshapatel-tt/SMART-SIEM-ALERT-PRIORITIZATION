@@ -1,32 +1,54 @@
-import textwrap
+"""
+SOC dashboard (Streamlit).
 
-import streamlit as st
+All data comes from the backend REST API (backend/api.py) - nothing is read
+from CSV files here any more. Start the backend first:
+
+    python -m backend.api
+    streamlit run app.py
+"""
+
+import os
+import time
+
 import pandas as pd
 import plotly.express as px
-import textwrap
+import requests
+import streamlit as st
 
-from scoring_engine import (
-    calculate_risk_score,
-    get_priority,
-    get_score_breakdown
-)
+API_URL = os.environ.get("SIEM_API_URL", "http://127.0.0.1:8000").rstrip("/")
+SEVERITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+STATUSES = ["NEW", "ACKNOWLEDGED", "INVESTIGATING", "RESOLVED", "FALSE_POSITIVE"]
+SEVERITY_COLORS = {
+    "CRITICAL": "#ff4d4d", "HIGH": "#ff8c42", "MEDIUM": "#f7c948", "LOW": "#2ec27e",
+}
 
+
+# ------------------------------------------------------------ API helpers
+def api_get(path, **params):
+    """GET <API_URL>/api/<path> -> parsed JSON. Raises on any failure."""
+    response = requests.get(f"{API_URL}/api/{path}", params=params, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def api_send(method, path, payload=None):
+    response = requests.request(method, f"{API_URL}/api/{path}", json=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
 # App page setup
 
-
 st.set_page_config(
-    page_title="Security Alert Prioritization",
+    page_title="Smart SIEM Alert Prioritization",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 
-
 # Styling tweaks for the dashboard look and feel
-
 
 st.markdown(
     """
@@ -270,44 +292,85 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# ---------------------------------------------------------------- sidebar
+with st.sidebar:
+
+    st.markdown("## 🔎 Alert Filters")
+
+    st.caption("Narrow down alerts for investigation.")
+
+    search_text = st.text_input(
+        "Search",
+        placeholder="Alert ID, asset, IP, user..."
+    )
+
+    selected_severity = st.multiselect(
+        "Severity", options=SEVERITIES, default=SEVERITIES
+    )
+
+    selected_status = st.multiselect(
+        "Status", options=STATUSES, default=STATUSES
+    )
+
+    minimum_score = st.slider("Minimum Risk Score", 0, 100, 0)
+
+    st.divider()
+    st.markdown("## ⚙️ Pipeline")
+
+    refresh_seconds = st.select_slider(
+        "Auto-refresh (seconds, 0 = off)",
+        options=[0, 5, 10, 30, 60],
+        value=10
+    )
+
+    if st.button("▶ Process logs now"):
+        try:
+            result = api_send("POST", "process")
+            st.success(
+                f"{result['events_parsed']} events read, "
+                f"{result['alerts_generated']} alerts generated"
+            )
+        except requests.RequestException as exc:
+            st.error(f"Processing failed: {exc}")
+
+    if st.button("📥 Load sample alerts (CSV)"):
+        try:
+            loaded = api_send("POST", "sample/load")["loaded"]
+            st.success(f"Loaded {loaded} sample alerts")
+        except requests.RequestException as exc:
+            st.error(f"Could not load sample alerts: {exc}")
+
+    st.caption(f"API: {API_URL}")
 
 
-# Read alert data from CSV
+# ------------------------------------------------------- load backend data
+try:
+    summary = api_get("dashboard/summary")
+    alerts_json = api_get("alerts", limit=2000)["alerts"]
+    trend_json = api_get("trend")["trend"]
+    distribution = api_get("distribution")
+    events_json = api_get("events", limit=25)["events"]
+except requests.RequestException as exc:
+    st.error(
+        f"Cannot reach the SIEM backend at {API_URL}.\n\n"
+        f"Start it with `python -m backend.api` (details: {exc})"
+    )
+    st.stop()
 
-
-df = pd.read_csv("data/alerts.csv")
-
-
-
-# Compute score and priority for each alert
-
-
-df["risk_score"] = df.apply(
-    calculate_risk_score,
-    axis=1
-)
-
-df["priority"] = df["risk_score"].apply(
-    get_priority
-)
-
-df = df.sort_values(
-    by="risk_score",
-    ascending=False
-).reset_index(drop=True)
-
+# The API already returns alerts in SOC priority order
+# (severity > risk score > frequency > asset criticality > correlation).
+df = pd.DataFrame(alerts_json)
 
 
 # Main heading
 
-
 st.markdown(
     """
     <div class="main-header">
-        <div class="main-title">🛡️ Security Alert Prioritization</div>
+        <div class="main-title">🛡️ Smart SIEM Alert Prioritization</div>
         <div class="main-subtitle">
-            Risk-based ranking of security alerts using severity,
-            asset importance, and event context.
+            Log-driven, rule-based alert triage: severity, asset importance
+            and event context combine into a 0-100 risk score.
         </div>
     </div>
     """,
@@ -315,231 +378,106 @@ st.markdown(
 )
 
 
-
-# KPI counts used in summary cards
-
-
-total_alerts = len(df)
-
-critical_count = len(
-    df[df["priority"] == "CRITICAL"]
-)
-
-high_count = len(
-    df[df["priority"] == "HIGH"]
-)
-
-medium_count = len(
-    df[df["priority"] == "MEDIUM"]
-)
-
-low_count = len(
-    df[df["priority"] == "LOW"]
-)
-
-
-
 # Top summary cards
 
-
-col1, col2, col3, col4, col5 = st.columns(5)
-
-
-with col1:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">TOTAL ALERTS</div>
-            <div class="metric-value">{total_alerts}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-with col2:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">🔴 CRITICAL</div>
-            <div class="metric-value critical-value">
-                {critical_count}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-with col3:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">🟠 HIGH</div>
-            <div class="metric-value high-value">
-                {high_count}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-with col4:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">🟡 MEDIUM</div>
-            <div class="metric-value medium-value">
-                {medium_count}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-with col5:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">🟢 LOW</div>
-            <div class="metric-value low-value">
-                {low_count}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-st.write("")
-
-
-
-# Sidebar filters
-
-
-with st.sidebar:
-
-    st.markdown("## 🔎 Alert Filters")
-
-    st.caption(
-        "Narrow down alerts for investigation."
-    )
-
-    search_text = st.text_input(
-        "Search",
-        placeholder="Alert ID, asset, IP..."
-    )
-
-    selected_priority = st.multiselect(
-        "Priority",
-        options=[
-            "CRITICAL",
-            "HIGH",
-            "MEDIUM",
-            "LOW"
-        ],
-        default=[
-            "CRITICAL",
-            "HIGH",
-            "MEDIUM",
-            "LOW"
-        ]
-    )
-
-    selected_alert_type = st.multiselect(
-        "Alert Type",
-        options=sorted(
-            df["alert_type"].unique()
-        ),
-        default=sorted(
-            df["alert_type"].unique()
-        )
-    )
-
-    minimum_score = st.slider(
-        "Minimum Risk Score",
-        min_value=0,
-        max_value=100,
-        value=0
-    )
-
-    st.divider()
-
-    st.caption(
-        "20 sample security alerts"
-    )
-
-
-
-# Apply selected filters
-
-
-filtered_df = df[
-    (df["priority"].isin(selected_priority))
-    &
-    (df["alert_type"].isin(selected_alert_type))
-    &
-    (df["risk_score"] >= minimum_score)
+cards = [
+    ("TOTAL ALERTS", summary["total_alerts"], ""),
+    ("🔴 CRITICAL", summary["critical"], "critical-value"),
+    ("🟠 HIGH", summary["high"], "high-value"),
+    ("🟡 MEDIUM", summary["medium"], "medium-value"),
+    ("🟢 LOW", summary["low"], "low-value"),
 ]
 
+for column, (label, value, css_class) in zip(st.columns(5), cards):
+    with column:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">{label}</div>
+                <div class="metric-value {css_class}">{value}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+st.caption(
+    f"Open alerts: {summary['open_alerts']} (critical: {summary['open_critical']}) · "
+    f"Security events stored: {summary['total_events']} · "
+    f"Last pipeline run: {summary['pipeline'].get('last_run') or 'not yet'}"
+)
+
+if summary["pipeline"].get("last_error"):
+    st.warning(f"Last pipeline run failed: {summary['pipeline']['last_error']}")
+
+if df.empty:
+    st.info(
+        "No alerts yet. Generate logs with `python tools/generate_logs.py "
+        "--scenario all`, or use the sidebar to process logs / load sample alerts."
+    )
+    if refresh_seconds:
+        time.sleep(refresh_seconds)
+        st.rerun()
+    st.stop()
 
 
-# Free-text search across key fields
-
+# ---------------------------------------------------------------- filters
+filtered_df = df[
+    df["severity"].isin(selected_severity)
+    & df["status"].isin(selected_status)
+    & (df["risk_score"] >= minimum_score)
+]
 
 if search_text:
-
-    search_text = search_text.lower()
-
-    search_mask = (
-        df["alert_id"].astype(str).str.lower().str.contains(
-            search_text,
-            na=False
-        )
-        |
-        df["alert_type"].astype(str).str.lower().str.contains(
-            search_text,
-            na=False
-        )
-        |
-        df["asset"].astype(str).str.lower().str.contains(
-            search_text,
-            na=False
-        )
-        |
-        df["source_ip"].astype(str).str.lower().str.contains(
-            search_text,
-            na=False
-        )
+    needle = search_text.lower()
+    haystack = (
+        df[["alert_id", "alert_type", "asset", "source_ip", "username"]]
+        .fillna("").astype(str).apply(lambda col: col.str.lower())
     )
+    mask = haystack.apply(lambda col: col.str.contains(needle, regex=False)).any(axis=1)
+    filtered_df = filtered_df[mask.loc[filtered_df.index]]
 
-    filtered_df = filtered_df[
-        search_mask.loc[filtered_df.index]
-    ]
+open_df = df[~df["status"].isin(["RESOLVED", "FALSE_POSITIVE"])]
 
 
+# ------------------------------------------------------ critical alerts
+st.markdown(
+    '<div class="section-title">🔥 Critical Alerts (open)</div>',
+    unsafe_allow_html=True
+)
 
-# Highlight the top five highest-risk alerts
+critical_open = open_df[open_df["severity"] == "CRITICAL"]
 
+if critical_open.empty:
+    st.success("No open critical alerts.")
+else:
+    for _, alert in critical_open.head(5).iterrows():
+        st.markdown(
+            f"""
+            <div class="top-alert" style="border-left: 4px solid #ff4d4d;">
+                <div class="alert-id">{alert['alert_id']} · {alert['alert_type']}
+                    <span class="risk-badge critical-badge">{alert['risk_score']:.1f}</span>
+                </div>
+                <div class="alert-asset">
+                    {alert['source_ip']} → {alert['asset']} · user: {alert['username'] or '-'}
+                    · status: {alert['status']}
+                </div>
+                <div class="alert-type">{alert['description']}</div>
+                <div class="alert-asset">➡ {alert['recommended_action']}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+# Highlight the top five highest-priority open alerts
 
 st.markdown(
     '<div class="section-title">🚨 Top Priority Alerts</div>',
     unsafe_allow_html=True
 )
 
-top_alerts = df.head(5)
-# Full prioritized alert table
-for _, alert in top_alerts.iterrows():
-    priority = alert["priority"]
-    badge_color = {
-        "CRITICAL": "#ff4b4b",
-        "HIGH": "#ff8c42",
-        "MEDIUM": "#fbbf24",
-        "LOW": "#36cfc9",
-    }.get(priority, "#a8b1c1")
+for _, alert in open_df.head(5).iterrows():
+    badge_color = SEVERITY_COLORS.get(alert["severity"], "#a8b1c1")
 
     st.markdown(
         f"""
@@ -553,13 +491,13 @@ for _, alert in top_alerts.iterrows():
             <div style="display:flex; justify-content:space-between; align-items:center; gap:12px;">
                 <div>
                     <div style="font-size: 0.9rem; color: #dfe4ee; font-weight: 600; margin-bottom: 4px;">
-                        {alert['alert_id']}
+                        {alert['alert_id']} · {alert['priority']}
                     </div>
                     <div style="font-size: 1rem; color: #f8f9fb; font-weight: 600; margin-bottom: 4px;">
                         {alert['alert_type']}
                     </div>
                     <div style="font-size: 0.8rem; color: #a7b0c2;">
-                        Affected asset: {alert['asset']}
+                        Affected asset: {alert['asset']} · Source IP: {alert['source_ip']}
                     </div>
                 </div>
                 <div style="text-align: right;">
@@ -573,7 +511,7 @@ for _, alert in top_alerts.iterrows():
                         font-weight: 700;
                         letter-spacing: 0.04em;
                         margin-bottom: 8px;
-                    ">{priority}</div>
+                    ">{alert['severity']}</div>
                     <div style="font-size: 1.2rem; font-weight: 700; color: #ffffff;">
                         {alert['risk_score']:.1f}
                     </div>
@@ -588,7 +526,6 @@ for _, alert in top_alerts.iterrows():
 
 # PRIORITIZED ALERT TABLE
 
-
 st.markdown(
     '<div class="section-title">📋 Prioritized Security Alerts</div>',
     unsafe_allow_html=True
@@ -596,40 +533,54 @@ st.markdown(
 
 if len(filtered_df) > 0:
 
-    display_columns = [
-        "alert_id",
-        "alert_type",
-        "asset",
-        "severity",
-        "asset_criticality",
-        "risk_score",
-        "priority"
-    ]
+    display_df = filtered_df[[
+        "priority", "severity", "risk_score", "alert_id", "alert_type", "source_ip",
+        "username", "asset", "failed_attempts", "status", "timestamp"
+    ]].copy()
+    display_df["risk_score"] = display_df["risk_score"].round(1)
 
-    display_df = filtered_df[
-        display_columns
-    ].copy()
-
-    display_df["risk_score"] = display_df[
-        "risk_score"
-    ].round(1)
-
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(display_df, hide_index=True)
 
 else:
 
-    st.info(
-        "No alerts match the selected filters."
-    )
+    st.info("No alerts match the selected filters.")
 
+
+# ------------------------------------------------ analyst: update status
+st.markdown(
+    '<div class="section-title">🛠️ Update Alert Status</div>',
+    unsafe_allow_html=True
+)
+
+if len(filtered_df) > 0:
+
+    col_a, col_b, col_c = st.columns([2, 2, 3])
+
+    with col_a:
+        status_alert_id = st.selectbox("Alert", filtered_df["alert_id"].tolist(), key="status_alert")
+
+    current_status = df.loc[df["alert_id"] == status_alert_id, "status"].iloc[0]
+
+    with col_b:
+        new_status = st.selectbox(
+            "New status", STATUSES, index=STATUSES.index(current_status), key="status_new"
+        )
+
+    with col_c:
+        note = st.text_input("Analyst note (optional)", key="status_note")
+
+    if st.button("Save status"):
+        try:
+            api_send("PATCH", f"alerts/{status_alert_id}/status",
+                     {"status": new_status, "note": note or None})
+            st.success(f"{status_alert_id} → {new_status}")
+            time.sleep(0.6)
+            st.rerun()
+        except requests.RequestException as exc:
+            st.error(f"Could not update status: {exc}")
 
 
 # Analytics section
-
 
 st.divider()
 
@@ -640,132 +591,87 @@ st.markdown(
 
 col1, col2 = st.columns(2)
 
-
-# Priority distribution chart
-
 with col1:
 
-    priority_counts = (
-        df["priority"]
-        .value_counts()
-        .reset_index()
+    severity_counts = (
+        df["severity"].value_counts().reindex(SEVERITIES, fill_value=0).reset_index()
     )
+    severity_counts.columns = ["severity", "count"]
 
-    priority_counts.columns = [
-        "priority",
-        "count"
-    ]
-
-    priority_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
-    priority_palette = {
-        "CRITICAL": "#ff4d4d",
-        "HIGH": "#ff8c42",
-        "MEDIUM": "#f7c948",
-        "LOW": "#2ec27e",
-    }
-
-    priority_counts = priority_counts[
-        priority_counts["priority"].isin(priority_order)
-    ].copy()
-    priority_counts["priority"] = pd.Categorical(
-        priority_counts["priority"],
-        categories=priority_order,
-        ordered=True,
+    fig_severity = px.pie(
+        severity_counts[severity_counts["count"] > 0],
+        names="severity", values="count", hole=0.55,
+        color="severity", color_discrete_map=SEVERITY_COLORS,
     )
-    priority_counts = priority_counts.sort_values("priority")
-
-    fig_priority = px.pie(
-        priority_counts,
-        names="priority",
-        values="count",
-        hole=0.55,
-        color_discrete_sequence=[
-            priority_palette[p] for p in priority_order if p in priority_counts["priority"].tolist()
-        ],
-    )
-
-    fig_priority.update_traces(
+    fig_severity.update_traces(
         textinfo="percent",
         texttemplate="%{percent:.0%}",
-        insidetextfont=dict(color="#111111", size=18),
-        textfont=dict(color="#111111", size=18 ),
+        textfont=dict(color="#111111", size=18),
     )
-
-    fig_priority.update_layout(
-        title="Priority Distribution",
-        template="plotly_dark",
-        margin=dict(
-            l=10,
-            r=10,
-            t=50,
-            b=10
-        ),
-        legend_title=""
+    fig_severity.update_layout(
+        title="Severity Distribution", template="plotly_dark",
+        margin=dict(l=10, r=10, t=50, b=10), legend_title=""
     )
-
-    st.plotly_chart(
-        fig_priority,
-        use_container_width=True
-    )
-
-
-# Alert type distribution chart
+    st.plotly_chart(fig_severity)
 
 with col2:
 
-    alert_type_counts = (
-        df["alert_type"]
-        .value_counts()
-        .reset_index()
+    trend_df = pd.DataFrame(trend_json)
+
+    if trend_df.empty:
+        st.info("No trend data yet.")
+    else:
+        trend_long = trend_df.melt(
+            id_vars="bucket", value_vars=SEVERITIES,
+            var_name="severity", value_name="alerts"
+        )
+        fig_trend = px.bar(
+            trend_long, x="bucket", y="alerts", color="severity",
+            color_discrete_map=SEVERITY_COLORS,
+            category_orders={"severity": SEVERITIES},
+        )
+        fig_trend.update_layout(
+            title="Alert Trend (per hour)", template="plotly_dark",
+            xaxis_title="", yaxis_title="Alerts", xaxis_tickangle=-35,
+            margin=dict(l=10, r=10, t=50, b=10), legend_title=""
+        )
+        st.plotly_chart(fig_trend)
+
+col3, col4 = st.columns(2)
+
+with col3:
+
+    hist_df = pd.DataFrame(
+        {"risk_score_range": list(distribution["risk_score"].keys()),
+         "alerts": list(distribution["risk_score"].values())}
     )
+    fig_hist = px.bar(hist_df, x="risk_score_range", y="alerts")
+    fig_hist.update_traces(marker_color="#62d0ff")
+    fig_hist.update_layout(
+        title="Risk Score Distribution", template="plotly_dark",
+        xaxis_title="Risk score", yaxis_title="Alerts",
+        margin=dict(l=10, r=10, t=50, b=10)
+    )
+    st.plotly_chart(fig_hist)
 
-    alert_type_counts.columns = [
-        "alert_type",
-        "count"
-    ]
+with col4:
 
-    alert_palette = [
-        "#00bcd4",
-        "#36cfc9",
-        "#facc15",
-        "#fb923c",
-        "#f87171",
-        "#a78bfa",
-        "#f472b6",
-    ]
+    alert_type_counts = df["alert_type"].value_counts().reset_index()
+    alert_type_counts.columns = ["alert_type", "count"]
 
     fig_alerts = px.bar(
-        alert_type_counts,
-        x="alert_type",
-        y="count",
-        color="alert_type",
-        color_discrete_sequence=alert_palette[:len(alert_type_counts)]
+        alert_type_counts, x="alert_type", y="count", color="alert_type",
+        color_discrete_sequence=px.colors.qualitative.Set2,
     )
-
     fig_alerts.update_layout(
-        title="Alerts by Type",
-        template="plotly_dark",
-        xaxis_tickangle=-35,
-        margin=dict(
-            l=10,
-            r=10,
-            t=50,
-            b=10
-        ),
-        xaxis_title="",
-        yaxis_title="Alerts",
-        showlegend=False,
+        title="Alerts by Type", template="plotly_dark", xaxis_tickangle=-35,
+        margin=dict(l=10, r=10, t=50, b=10),
+        xaxis_title="", yaxis_title="Alerts", showlegend=False,
     )
-
-    st.plotly_chart(
-        fig_alerts,
-        use_container_width=True
-    )
-
+    st.plotly_chart(fig_alerts)
 
 
 # Risk score breakdown for one selected alert
-
 
 st.divider()
 
@@ -776,119 +682,88 @@ st.markdown(
 
 if len(filtered_df) > 0:
 
-    st.markdown(
-        """
-        <div style="
-            background: #131922;
-            border: 1px solid #2c3542;
-            border-radius: 12px;
-            padding: 14px 16px 12px 16px;
-            margin-bottom: 18px;
-        ">
-            <div style="font-size: 0.8rem; color: #aab2bf; margin-bottom: 8px;">
-                Select an alert to inspect
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     selected_alert_id = st.selectbox(
-        "",
+        "Select an alert to inspect",
         filtered_df["alert_id"].tolist(),
-        label_visibility="collapsed",
+        key="breakdown_alert",
     )
 
-    selected_alert = filtered_df[
-        filtered_df["alert_id"] == selected_alert_id
-    ].iloc[0]
-
-    breakdown = get_score_breakdown(
-        selected_alert
-    )
+    # The breakdown is computed by the backend scoring engine and stored
+    # with the alert, so the dashboard never re-implements the formula.
+    selected_alert = api_get(f"alerts/{selected_alert_id}")
+    breakdown = selected_alert["score_breakdown"] or {}
 
     st.markdown(
         f"""
-        <div style="
-            font-size: 1.05rem;
-            color: #e5e7eb;
-            margin: 12px 0 16px 0;
-            font-weight: 600;
-        ">
+        <div style="font-size: 1.05rem; color: #e5e7eb; margin: 12px 0 6px 0; font-weight: 600;">
             {selected_alert['alert_type']} • {selected_alert['asset']}
         </div>
+        <div style="color:#9ca3af; margin-bottom: 14px;">{selected_alert['description']}</div>
         """,
         unsafe_allow_html=True,
     )
+
+    def breakdown_card(title, score, color, weight_note):
+        return f"""
+        <div style="background: #151b26; border: 1px solid #2a3441; border-radius: 12px; padding: 16px; min-height: 150px;">
+            <div style="font-size: 0.9rem; color: #b1bac7; margin-bottom: 10px;">{title}</div>
+            <div style="font-size: 2.2rem; font-weight: 700; color: {color}; line-height: 1.1;">{score}/100</div>
+            <div style="font-size: 0.82rem; color: #9aa4b2; margin-top: 16px;">{weight_note}</div>
+        </div>
+        """
 
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        st.markdown(
-            """
-            <div style="background: #151b26; border: 1px solid #2a3441; border-radius: 12px; padding: 16px; min-height: 150px;">
-                <div style="font-size: 0.9rem; color: #b1bac7; margin-bottom: 10px;">Severity</div>
-                <div style="font-size: 2.2rem; font-weight: 700; color: #ff6b6b; line-height: 1.1;">{score}/100</div>
-                <div style="font-size: 0.82rem; color: #9aa4b2; margin-top: 16px;">Weight: 40% • +{contribution}</div>
-            </div>
-            """.format(score=breakdown['severity_score'], contribution=breakdown['severity_contribution']),
-            unsafe_allow_html=True,
-        )
+        st.markdown(breakdown_card(
+            "Severity", breakdown.get("severity_score", "-"), "#ff6b6b",
+            f"Weight: 40% • +{breakdown.get('severity_contribution', '-')}"
+        ), unsafe_allow_html=True)
 
     with col2:
-        st.markdown(
-            """
-            <div style="background: #151b26; border: 1px solid #2a3441; border-radius: 12px; padding: 16px; min-height: 150px;">
-                <div style="font-size: 0.9rem; color: #b1bac7; margin-bottom: 10px;">Asset Importance</div>
-                <div style="font-size: 2.2rem; font-weight: 700; color: #62d0ff; line-height: 1.1;">{score}/100</div>
-                <div style="font-size: 0.82rem; color: #9aa4b2; margin-top: 16px;">Weight: 30% • +{contribution}</div>
-            </div>
-            """.format(score=breakdown['asset_score'], contribution=breakdown['asset_contribution']),
-            unsafe_allow_html=True,
-        )
+        st.markdown(breakdown_card(
+            "Asset Importance", breakdown.get("asset_score", "-"), "#62d0ff",
+            f"Weight: 30% • +{breakdown.get('asset_contribution', '-')}"
+        ), unsafe_allow_html=True)
 
     with col3:
-        st.markdown(
-            """
-            <div style="background: #151b26; border: 1px solid #2a3441; border-radius: 12px; padding: 16px; min-height: 150px;">
-                <div style="font-size: 0.9rem; color: #b1bac7; margin-bottom: 10px;">Event Context</div>
-                <div style="font-size: 2.2rem; font-weight: 700; color: #ffd166; line-height: 1.1;">{score}/100</div>
-                <div style="font-size: 0.82rem; color: #9aa4b2; margin-top: 16px;">Weight: 30% • +{contribution}</div>
-            </div>
-            """.format(score=breakdown['context_score'], contribution=breakdown['context_contribution']),
-            unsafe_allow_html=True,
-        )
+        st.markdown(breakdown_card(
+            "Event Context", breakdown.get("context_score", "-"), "#ffd166",
+            f"Weight: 30% • +{breakdown.get('context_contribution', '-')}"
+        ), unsafe_allow_html=True)
 
     with col4:
-        priority_color = {
-            "CRITICAL": ("#3a171b", "#ff6b6b"),
-            "HIGH": ("#3a2816", "#ffad5c"),
-            "MEDIUM": ("#393117", "#f6ce67"),
-            "LOW": ("#143022", "#61d995"),
-        }.get(selected_alert["priority"], ("#1a1219", "#ff8fab"))
+        color = SEVERITY_COLORS.get(selected_alert["severity"], "#ff8fab")
+        st.markdown(breakdown_card(
+            "Final Risk", selected_alert["risk_score"], color,
+            f"Severity: {selected_alert['severity']} • {selected_alert['priority']}"
+        ), unsafe_allow_html=True)
 
-        bg_color, text_color = priority_color
+    st.write("")
+    st.markdown("**Why this score:** " + " · ".join(selected_alert["reasons"] or []))
+    st.markdown(f"**Recommended action:** {selected_alert['recommended_action']}")
 
-        st.markdown(
-            """
-            <div style="background: {bg}; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; min-height: 150px;">
-                <div style="font-size: 0.9rem; color: #e5e7eb; margin-bottom: 10px;">Final Risk</div>
-                <div style="font-size: 2.2rem; font-weight: 700; color: {text}; line-height: 1.1;">{score}/100</div>
-                <div style="font-size: 0.82rem; color: #f3f4f6; margin-top: 16px;">Priority: {priority}</div>
-            </div>
-            """.format(
-                bg=bg_color,
-                text=text_color,
-                score=breakdown['final_score'],
-                priority=selected_alert['priority'],
-            ),
-            unsafe_allow_html=True,
-        )
 
+# Recent security events (raw log events stored by the pipeline)
+
+st.divider()
+
+st.markdown(
+    '<div class="section-title">🧾 Recent Security Events</div>',
+    unsafe_allow_html=True
+)
+
+if events_json:
+    events_df = pd.DataFrame(events_json)[[
+        "timestamp", "event_type", "status", "username", "source_ip",
+        "resource", "failed_attempts", "frequency_per_min", "attack_type"
+    ]]
+    st.dataframe(events_df, hide_index=True)
+else:
+    st.info("No security events stored yet.")
 
 
 # Scoring methodology notes
-
 
 st.divider()
 
@@ -903,26 +778,26 @@ st.markdown(
 
     <div class="methodology-item">
     <b>Severity — 40%</b><br>
-    Measures how serious the detected security event is.
+    Base seriousness of the detected event (e.g. brute force 90,
+    ransomware 100, failed login 30).
     </div>
 
     <div class="methodology-item">
     <b>Asset Importance — 30%</b><br>
-    Measures the business importance or sensitivity of
-    the affected asset.
+    Business importance of the affected asset.
     </div>
 
     <div class="methodology-item">
     <b>Event Context — 30%</b><br>
-    Considers surrounding conditions such as repeated
-    attempts, malicious IPs, after-hours activity,
-    and affected users.
+    Failed attempts, known-malicious IP, after-hours activity, affected
+    users, privileged account, event frequency and correlation with other
+    detections from the same source.
     </div>
 
     <br>
 
     <div class="methodology-item">
-    <b>Priority Thresholds</b><br>
+    <b>Severity thresholds</b><br>
     🔴 Critical: 90–100 &nbsp; | &nbsp;
     🟠 High: 70–89 &nbsp; | &nbsp;
     🟡 Medium: 40–69 &nbsp; | &nbsp;
@@ -940,7 +815,13 @@ st.divider()
 
 st.markdown(
     "<div style='text-align: center; color: #8c8c8c; font-size: 0.9rem;'>"
-    "Security Alert Prioritization — Project by Vatsal Gajjar (SOC Intern)"
+    "Security Alert Prioritization — Project by Harsha Patel (SOC Intern)"
     "</div>",
     unsafe_allow_html=True,
 )
+
+
+# Periodic refresh: re-run the script so new alerts appear automatically
+if refresh_seconds:
+    time.sleep(refresh_seconds)
+    st.rerun()

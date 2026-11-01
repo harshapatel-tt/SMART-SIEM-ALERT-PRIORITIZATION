@@ -27,6 +27,28 @@ def calculate_context_score(alert):
     elif alert["affected_users"] >= 5:
         score += 10
 
+    # ---- Optional signals produced by the log-based detection pipeline.
+    # They use .get(..., 0) so alerts without them (e.g. data/alerts.csv)
+    # keep exactly the same score as before.
+
+    # Privileged / high-importance account targeted (admin, root, ...)
+    if alert.get("privileged_user", 0) == 1:
+        score += 10
+
+    # Attack frequency: peak events per minute from the source
+    peak_rate = alert.get("peak_rate_per_min", 0)
+    if peak_rate >= 60:
+        score += 20
+    elif peak_rate >= 20:
+        score += 10
+
+    # Event correlation: other, different detections from the same source
+    correlated = alert.get("correlated_events", 0)
+    if correlated >= 2:
+        score += 25
+    elif correlated == 1:
+        score += 15
+
     return min(score, 100)
 
 
@@ -155,7 +177,42 @@ def get_priority_reason(alert, score):
     if alert["affected_users"] >= 5:
         reasons.append("Multiple users affected")
 
+    if alert.get("privileged_user", 0) == 1:
+        reasons.append("Privileged account targeted")
+
+    if alert.get("peak_rate_per_min", 0) >= 20:
+        reasons.append("High event frequency from source")
+
+    if alert.get("correlated_events", 0) >= 1:
+        reasons.append("Correlated with other detections from same source")
+
     if not reasons:
         reasons.append("No major risk indicators detected")
 
     return reasons
+
+
+# Severity label ordering used for sorting (1 = most urgent)
+SEVERITY_RANK = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4}
+
+# SOC triage priority derived from the severity label
+PRIORITY_LABEL = {
+    "CRITICAL": "P1 - Immediate",
+    "HIGH": "P2 - Urgent",
+    "MEDIUM": "P3 - Normal",
+    "LOW": "P4 - Low",
+}
+
+
+def get_severity(score):
+    """
+    Severity label for a risk score. Uses the same thresholds as
+    get_priority() so there is a single source of truth
+    (CRITICAL >= 90, HIGH >= 70, MEDIUM >= 40, LOW < 40).
+    """
+    return get_priority(score)
+
+
+def get_priority_label(severity):
+    """Maps a severity label to a SOC triage priority (P1..P4)."""
+    return PRIORITY_LABEL.get(severity, "P4 - Low")
